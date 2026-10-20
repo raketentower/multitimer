@@ -2,6 +2,8 @@
 <html lang="de">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-8EfatKbK1oOYljeqoXxB5fzRGAj67LWx5pi+imcrRhk='; style-src 'unsafe-inline'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -169,6 +171,7 @@
 
 <script>
 (() => {
+  'use strict';
   const $ = (s) => document.querySelector(s);
   const LS_CFG = 'multitimer.config', LS_HIST = 'multitimer.history', LS_SOUND = 'multitimer.sound';
 
@@ -188,18 +191,50 @@
   ];
   const byKey = Object.fromEntries(FIELDS.map((f) => [f.key, f]));
 
-  let cfg = Object.assign(Object.fromEntries(FIELDS.map((f) => [f.key, f.def])), { half: false }, load(LS_CFG, {}));
-  let hist = load(LS_HIST, []);
-  let soundOn = load(LS_SOUND, true);
+  // ---------- Gespeicherte Daten prüfen ----------
+  // Auf github.io teilen sich alle Projekte eines Accounts denselben localStorage.
+  // Darum wird alles Gelesene in gültige Zahlen umgewandelt, bevor es irgendwo landet.
+  const MAX_DATE = 8.64e15;
+  function int(v, min, max, def) {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def;
+  }
+  function cleanCfg(c) {
+    const src = c && typeof c === 'object' ? c : {};
+    const out = { half: src.half === true };
+    FIELDS.forEach((f) => { out[f.key] = int(src[f.key], f.min, f.max, f.def); });
+    return out;
+  }
+  function cleanEntry(h) {
+    if (!h || typeof h !== 'object') return null;
+    const c = cleanCfg(h.cfg);
+    const date = int(h.date, 0, MAX_DATE, 0);
+    const workTotal = c.intervals * c.rounds;
+    const workDone = int(h.workDone, 0, workTotal, 0);
+    return {
+      id: int(h.id, 0, MAX_DATE, date), date, cfg: c, complete: h.complete === true,
+      workDone, workTotal, roundsDone: Math.floor(workDone / c.intervals),
+      activeSec: int(h.activeSec, 0, 1e7, 0),
+    };
+  }
+  function loadHistory() {
+    const raw = load(LS_HIST, []);
+    return Array.isArray(raw) ? raw.slice(0, 200).map(cleanEntry).filter(Boolean) : [];
+  }
+
+  let cfg = cleanCfg(load(LS_CFG, {}));
+  let hist = loadHistory();
+  let soundOn = load(LS_SOUND, true) !== false;
 
   // ---------- Formatierung ----------
   const pad = (n) => String(n).padStart(2, '0');
   function fmt(sec) {
-    sec = Math.max(0, Math.round(sec));
+    sec = Math.max(0, Math.round(Number(sec) || 0));
     const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
     return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
   }
   const dateFmt = new Intl.DateTimeFormat('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  function fmtDate(ms) { try { return dateFmt.format(new Date(ms)); } catch (e) { return '–'; } }
 
   // ---------- Einstellungen ----------
   function fieldHTML(f) {
@@ -226,7 +261,7 @@
   }
   function setVal(key, v) {
     const f = byKey[key];
-    cfg[key] = Math.min(f.max, Math.max(f.min, Math.round(v) || 0));
+    cfg[key] = int(v, f.min, f.max, f.min);
     writeField(key);
     store(LS_CFG, cfg);
     updateTotal();
@@ -275,8 +310,8 @@
   updateTotal();
 
   const halfBox = $('#half');
-  function setHalf(on) { cfg.half = !!on; halfBox.checked = cfg.half; store(LS_CFG, cfg); }
-  halfBox.checked = !!cfg.half;
+  function setHalf(on) { cfg.half = on === true; halfBox.checked = cfg.half; store(LS_CFG, cfg); }
+  halfBox.checked = cfg.half;
   halfBox.addEventListener('change', () => setHalf(halfBox.checked));
 
   // ---------- Ton, Vibration, Bildschirm an ----------
@@ -435,13 +470,12 @@
     const c = r.cfg;
     let workDone = 0;
     for (let k = 0; k < Math.min(r.idx, r.phases.length); k++) if (r.phases[k].type === 'work') workDone++;
-    const entry = {
+    const entry = cleanEntry({
       id: r.startedAt, date: r.startedAt, cfg: c, complete,
-      workDone, workTotal: c.intervals * c.rounds,
-      roundsDone: Math.floor(workDone / c.intervals),
-      activeSec: Math.round(r.activeMs / 1000),
-    };
+      workDone, activeSec: Math.round(r.activeMs / 1000),
+    });
     if (complete || workDone > 0) {
+      hist = loadHistory();          // aktuellen Stand neu lesen (z. B. zweiter Tab)
       hist.unshift(entry);
       hist = hist.slice(0, 200);
       store(LS_HIST, hist);
@@ -451,10 +485,10 @@
 
     $('#d-title').textContent = complete ? 'Geschafft!' : 'Training beendet';
     $('#d-sub').textContent = complete ? '' : (workDone > 0 ? 'Vorzeitig beendet, im Verlauf gespeichert.' : 'Noch kein Intervall geschafft, nicht gespeichert.');
-    $('#d-int').textContent = `${workDone}/${entry.workTotal}`;
+    $('#d-int').textContent = `${entry.workDone}/${entry.workTotal}`;
     $('#d-rounds').textContent = `${entry.roundsDone}/${c.rounds}`;
     $('#d-time').textContent = fmt(entry.activeSec);
-    $('#d-work').textContent = fmt(workDone * c.work);
+    $('#d-work').textContent = fmt(entry.workDone * c.work);
     show('done');
   }
 
@@ -486,23 +520,41 @@
   });
 
   // ---------- Verlauf ----------
-  function histHTML(h) {
+  // Verlauf wird per DOM-API gebaut statt per innerHTML: gespeicherte Werte
+  // können so niemals als HTML oder Skript interpretiert werden.
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function histItem(h) {
     const c = h.cfg;
     const status = h.complete ? 'komplett' : `abgebrochen · ${h.workDone}/${h.workTotal} Intervalle`;
-    return `<li class="h-item">
-      <div class="h-main">
-        <div class="h-date">${dateFmt.format(new Date(h.date))}</div>
-        <div class="h-cfg">${c.rounds} × ${c.intervals} · ${fmt(c.work)} / ${fmt(c.rest)} · Rundenpause ${fmt(c.roundRest)}</div>
-        <div class="h-stat ${h.complete ? 'ok' : 'ab'}">${status} · ${fmt(h.activeSec)}</div>
-      </div>
-      <div class="h-act">
-        <button data-load="${h.id}" aria-label="Einstellungen übernehmen">Laden</button>
-        <button class="del" data-del="${h.id}" aria-label="Eintrag löschen">×</button>
-      </div></li>`;
+    const li = el('li', 'h-item');
+    const main = el('div', 'h-main');
+    main.append(
+      el('div', 'h-date', fmtDate(h.date)),
+      el('div', 'h-cfg', `${c.rounds} × ${c.intervals} · ${fmt(c.work)} / ${fmt(c.rest)} · Rundenpause ${fmt(c.roundRest)}`),
+      el('div', `h-stat ${h.complete ? 'ok' : 'ab'}`, `${status} · ${fmt(h.activeSec)}`),
+    );
+    const act = el('div', 'h-act');
+    const bLoad = el('button', null, 'Laden');
+    bLoad.type = 'button';
+    bLoad.dataset.load = String(h.id);
+    bLoad.setAttribute('aria-label', 'Einstellungen übernehmen');
+    const bDel = el('button', 'del', '×');
+    bDel.type = 'button';
+    bDel.dataset.del = String(h.id);
+    bDel.setAttribute('aria-label', 'Eintrag löschen');
+    act.append(bLoad, bDel);
+    li.append(main, act);
+    return li;
   }
 
   function renderHistory() {
-    $('#h-list').innerHTML = hist.length ? hist.map(histHTML).join('') : '<li class="empty">Noch keine Trainings gespeichert.</li>';
+    const list = $('#h-list');
+    list.replaceChildren(...(hist.length ? hist.map(histItem) : [el('li', 'empty', 'Noch keine Trainings gespeichert.')]));
     $('#b-clear').hidden = !hist.length;
     if (!hist.length) { $('#h-sum').textContent = ''; return; }
     const weekAgo = Date.now() - 7 * 864e5;
